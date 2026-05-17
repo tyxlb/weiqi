@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>围棋棋盘 - 单机增强版</title>
+  <style>
+    body { display: flex; flex-direction: column; align-items: center; background: #f0f2f5; padding: 20px; font-family: system-ui; }
+    .toolbar { background: #fff; padding: 12px 16px; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.1); display: flex; gap: 10px; margin-bottom: 12px; align-items: center; flex-wrap: wrap; }
+    .mode-btn { padding: 5px 12px; border: 1px solid #ccc; background: #fff; border-radius: 4px; cursor: pointer; }
+    .mode-btn.active { background: #2563eb; color: #fff; border-color: #2563eb; }
+    .mode-btn:hover:not(.active) { background: #f3f4f6; }
+    button.action { padding: 5px 12px; border: none; background: #10b981; color: #fff; border-radius: 4px; cursor: pointer; }
+    button.action:hover { background: #059669; }
+    input[type="number"] { width: 50px; padding: 4px 6px; border: 1px solid #ccc; border-radius: 4px; }
+    canvas { background: #deb887; border-radius: 4px; box-shadow: 0 4px 10px rgba(0,0,0,0.2); cursor: crosshair; }
+    #jsonPanel { margin-top: 12px; width: 100%; max-width: 700px; display: none; }
+    #jsonPanel textarea { width: 100%; height: 120px; font-family: monospace; font-size: 12px; padding: 8px; border: 1px solid #ccc; border-radius: 4px; resize: vertical; box-sizing: border-box; }
+    #jsonPanel .json-actions { margin-top: 6px; display: flex; gap: 8px; align-items: center; }
+    #status { margin-left: 8px; font-weight: 500; color: #333; }
+  </style>
+</head>
+<body>
+
+<div class="toolbar">
+  <button class="mode-btn active" id="btnModePlace">♟️ 落子</button>
+  <button class="mode-btn" id="btnModeForbidden">🚫 禁着点</button>
+  
+  <span style="width:1px; height:20px; background:#e5e7eb; margin:0 4px;"></span>
+  
+  <label style="font-size:12px; color:#555;">尺寸:
+    <input type="number" id="inputCols" value="11" min="5" max="23"> × 
+    <input type="number" id="inputRows" value="11" min="5" max="23">
+  </label>
+  <button class="action" id="btnApplySize">应用</button>
+  
+  <span style="width:1px; height:20px; background:#e5e7eb; margin:0 4px;"></span>
+  
+  <button class="action" id="btnJson">📋 JSON 导入/导出</button>
+  <span id="status"></span>
+</div>
+
+<canvas id="goBoard"></canvas>
+
+<div id="jsonPanel">
+  <textarea id="jsonInput" placeholder="点击「导入/导出」将加载当前状态，编辑后点击「应用修改」生效"></textarea>
+  <div class="json-actions">
+    <button class="action" id="btnApplyJson">✅ 应用修改</button>
+    <button class="mode-btn" id="btnCloseJson">✕ 关闭</button>
+    <span id="jsonMsg" style="margin-left:10px; font-size:12px; color:#666;"></span>
+  </div>
+</div>
+
+<script>
+class GoEngine {
+  createInitialState(cols = 9, rows = 9) {
+    return {
+      cols, rows,
+      board: Array.from({ length: rows }, () => Array(cols).fill(0)),
+      currentPlayer: 1,
+      moveCount: 0,
+      lastMove: null
+    };
+  }
+  clone(state) { return JSON.parse(JSON.stringify(state)); }
+
+  getNeighbors(x, y, cols, rows) {
+    const dirs = [[1,0], [-1,0], [0,1], [0,-1]];
+    return dirs.map(([dx, dy]) => [
+      (x + dx + cols) % cols,
+      (y + dy + rows) % rows
+    ]);
+  }
+
+  findGroup(state, startX, startY) {
+    const { board, cols, rows } = state;
+    const color = board[startY][startX];
+    const stones = [], liberties = new Set(), visited = new Set();
+    const queue = [[startX, startY]];
+    visited.add(`${startX},${startY}`);
+
+    while (queue.length) {
+      const [cx, cy] = queue.shift();
+      stones.push([cx, cy]);
+      for (const [nx, ny] of this.getNeighbors(cx, cy, cols, rows)) {
+        const key = `${nx},${ny}`;
+        if (visited.has(key)) continue;
+        visited.add(key);
+        const val = board[ny][nx];
+        if (val === 0) liberties.add(key);
+        else if (val === color) queue.push([nx, ny]);
+      }
+    }
+    return { stones, liberties: liberties.size };
+  }
+
+  toggleForbidden(state, x, y) {
+    if (x < 0 || x >= state.cols || y < 0 || y >= state.rows) return state;
+    const val = state.board[y][x];
+    if (val !== 0 && val !== 3) return state;
+    const next = this.clone(state);
+    next.board[y][x] = val === 0 ? 3 : 0;
+    return next;
+  }
+
+  applyMove(state, x, y) {
+    if (x < 0 || x >= state.cols || y < 0 || y >= state.rows) return null;
+    if (state.board[y][x] !== 0) return null;
+
+    const next = this.clone(state);
+    next.board[y][x] = next.currentPlayer;
+
+    const opponent = next.currentPlayer === 1 ? 2 : 1;
+    let captured = false;
+    for (const [nx, ny] of this.getNeighbors(x, y, next.cols, next.rows)) {
+      if (next.board[ny][nx] === opponent) {
+        const group = this.findGroup(next, nx, ny);
+        if (group.liberties === 0) {
+          group.stones.forEach(([sx, sy]) => next.board[sy][sx] = 0);
+          captured = true;
+        }
+      }
+    }
+
+    const selfGroup = this.findGroup(next, x, y);
+    if (selfGroup.liberties === 0 && !captured) return null;
+
+    next.currentPlayer = opponent;
+    next.moveCount++;
+    next.lastMove = { x, y, player: next.currentPlayer === 1 ? 2 : 1 };
+    return next;
+  }
+}
+
+class GoRenderer {
+  constructor(canvas) {
+    this.canvas = canvas;
+    this.ctx = canvas.getContext('2d');
+    this.cellSize = 40;
+    this.margin = 30;
+  }
+
+  resize(cols, rows) {
+    this.canvas.width = (cols - 1) * this.cellSize + 2 * this.margin;
+    this.canvas.height = (rows - 1) * this.cellSize + 2 * this.margin;
+  }
+
+  draw(state) {
+    const { ctx, cellSize, margin } = this;
+    ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+
+    ctx.strokeStyle = '#5c3a21';
+    ctx.lineWidth = 1.5;
+
+    // 内部横向线段
+    ctx.beginPath();
+    for (let y = 0; y < state.rows; y++) {
+      for (let x = 0; x < state.cols - 1; x++) {
+        if (state.board[y][x] !== 3 && state.board[y][x+1] !== 3) {
+          ctx.moveTo(margin + x * cellSize, margin + y * cellSize);
+          ctx.lineTo(margin + (x + 1) * cellSize, margin + y * cellSize);
+        }
+      }
+    }
+    ctx.stroke();
+
+    // 内部纵向线段
+    ctx.beginPath();
+    for (let x = 0; x < state.cols; x++) {
+      for (let y = 0; y < state.rows - 1; y++) {
+        if (state.board[y][x] !== 3 && state.board[y+1][x] !== 3) {
+          ctx.moveTo(margin + x * cellSize, margin + y * cellSize);
+          ctx.lineTo(margin + x * cellSize, margin + (y + 1) * cellSize);
+        }
+      }
+    }
+    ctx.stroke();
+
+    // 边界环绕连接线（横向：左↔右）
+    ctx.save();
+    ctx.beginPath();
+    ctx.setLineDash([5, 4]);
+    ctx.strokeStyle = '#8b7355';
+    ctx.lineWidth = 1;
+    const wrapLen = Math.min(18, cellSize * 0.45);
+    
+    for (let y = 0; y < state.rows; y++) {
+      if (state.board[y][state.cols - 1] !== 3 && state.board[y][0] !== 3) {
+        const py = margin + y * cellSize;
+        ctx.moveTo(margin + (state.cols - 1) * cellSize, py);
+        ctx.lineTo(margin + (state.cols - 1) * cellSize + wrapLen, py);
+        ctx.moveTo(margin, py);
+        ctx.lineTo(margin - wrapLen, py);
+      }
+    }
+    ctx.stroke();
+
+    // 边界环绕连接线（纵向：上↔下）
+    ctx.beginPath();
+    for (let x = 0; x < state.cols; x++) {
+      if (state.board[state.rows - 1][x] !== 3 && state.board[0][x] !== 3) {
+        const px = margin + x * cellSize;
+        ctx.moveTo(px, margin + (state.rows - 1) * cellSize);
+        ctx.lineTo(px, margin + (state.rows - 1) * cellSize + wrapLen);
+        ctx.moveTo(px, margin);
+        ctx.lineTo(px, margin - wrapLen);
+      }
+    }
+    ctx.stroke();
+    ctx.restore();
+
+    // 绘制棋子
+    for (let y = 0; y < state.rows; y++) {
+      for (let x = 0; x < state.cols; x++) {
+        const val = state.board[y][x];
+        if (val === 1 || val === 2) this.drawStone(x, y, val);
+      }
+    }
+
+    // 最后落子标记
+    if (state.lastMove) {
+      const { x, y } = state.lastMove;
+      const cx = margin + x * cellSize;
+      const cy = margin + y * cellSize;
+      ctx.fillStyle = state.board[y][x] === 1 ? '#fff' : '#000';
+      ctx.beginPath(); 
+      ctx.arc(cx, cy, cellSize * 0.15, 0, Math.PI * 2); 
+      ctx.fill();
+    }
+  }
+
+  drawStone(x, y, color) {
+    const ctx = this.ctx;
+    const cx = this.margin + x * this.cellSize;
+    const cy = this.margin + y * this.cellSize;
+    const r = this.cellSize * 0.42;
+    
+    ctx.fillStyle = 'rgba(0,0,0,0.3)';
+    ctx.beginPath(); ctx.arc(cx+2, cy+2, r, 0, Math.PI*2); ctx.fill();
+    
+    ctx.fillStyle = color === 1 ? '#111' : '#f8f9fa';
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2); ctx.fill();
+    if (color === 2) { ctx.strokeStyle = '#444'; ctx.lineWidth = 1; ctx.stroke(); }
+  }
+
+  getGridPos(mx, my) {
+    return {
+      x: Math.round((mx - this.margin) / this.cellSize),
+      y: Math.round((my - this.margin) / this.cellSize)
+    };
+  }
+}
+
+class GoBoard {
+  constructor(canvas, options = {}) {
+    this.engine = new GoEngine();
+    this.renderer = new GoRenderer(canvas);
+    this.state = this.engine.createInitialState(options.cols, options.rows);
+    this.mode = 'place';
+    this.listeners = {};
+
+    this.renderer.resize(this.state.cols, this.state.rows);
+    this.renderer.draw(this.state);
+
+    canvas.addEventListener('click', (e) => this.handleClick(e));
+  }
+
+  setMode(mode) {
+    this.mode = mode;
+    this.renderer.canvas.style.cursor = mode === 'forbidden' ? 'cell' : 'crosshair';
+  }
+
+  resizeBoard(cols, rows) {
+    cols = Math.max(5, Math.min(23, cols|0));
+    rows = Math.max(5, Math.min(23, rows|0));
+    this.state = this.engine.createInitialState(cols, rows);
+    this.renderer.resize(cols, rows);
+    this.renderer.draw(this.state);
+    this._emit('stateChange', this.state);
+  }
+
+  setState(newState) {
+    if (!newState?.board || !Array.isArray(newState.board)) return false;
+    this.state = newState;
+    this.renderer.resize(this.state.cols, this.state.rows);
+    this.renderer.draw(this.state);
+    this._emit('stateChange', this.state);
+    return true;
+  }
+
+  getState() { return this.engine.clone(this.state); }
+
+  requestMove(x, y) {
+    const next = this.engine.applyMove(this.state, x, y);
+    if (!next) { this._emit('moveInvalid', { x, y }); return false; }
+    this.state = next;
+    this.renderer.draw(this.state);
+    this._emit('moveSuccess', { x, y, state: this.state });
+    this._emit('stateChange', this.state);
+    return true;
+  }
+
+  requestToggleForbidden(x, y) {
+    const next = this.engine.toggleForbidden(this.state, x, y);
+    if (next === this.state) return false;
+    this.state = next;
+    this.renderer.draw(this.state);
+    this._emit('forbiddenToggle', { x, y, val: next.board[y][x], state: this.state });
+    this._emit('stateChange', this.state);
+    return true;
+  }
+
+  handleClick(e) {
+    const rect = this.renderer.canvas.getBoundingClientRect();
+    const { x, y } = this.renderer.getGridPos(e.clientX - rect.left, e.clientY - rect.top);
+    this.mode === 'forbidden' ? this.requestToggleForbidden(x, y) : this.requestMove(x, y);
+  }
+
+  on(event, cb) { (this.listeners[event] ||= []).push(cb); }
+  _emit(event, data) { (this.listeners[event] || []).forEach(cb => cb(data)); }
+}
+
+// ============ UI 初始化 ============
+const canvas = document.getElementById('goBoard');
+const statusEl = document.getElementById('status');
+const jsonPanel = document.getElementById('jsonPanel');
+const jsonInput = document.getElementById('jsonInput');
+const jsonMsg = document.getElementById('jsonMsg');
+
+const board = new GoBoard(canvas, { cols: 11, rows: 11 });
+
+board.on('stateChange', (s) => {
+  statusEl.textContent = `轮次: ${s.moveCount} | 当前: ${s.currentPlayer === 1 ? '黑' : '白'}`;
+});
+
+// 模式切换
+const btnPlace = document.getElementById('btnModePlace');
+const btnFb = document.getElementById('btnModeForbidden');
+btnPlace.onclick = () => { board.setMode('place'); btnPlace.classList.add('active'); btnFb.classList.remove('active'); };
+btnFb.onclick = () => { board.setMode('forbidden'); btnFb.classList.add('active'); btnPlace.classList.remove('active'); };
+
+// 自定义尺寸
+document.getElementById('btnApplySize').onclick = () => {
+  const cols = parseInt(document.getElementById('inputCols').value) || 11;
+  const rows = parseInt(document.getElementById('inputRows').value) || 11;
+  board.resizeBoard(cols, rows);
+  document.getElementById('inputCols').value = board.state.cols;
+  document.getElementById('inputRows').value = board.state.rows;
+};
+
+let jsonPanelVisible = false;
+document.getElementById('btnJson').onclick = () => {
+  jsonPanelVisible = !jsonPanelVisible;
+  jsonPanel.style.display = jsonPanelVisible ? 'block' : 'none';
+  if (jsonPanelVisible) {
+    // 打开面板时自动加载当前状态
+    jsonInput.value = JSON.stringify(board.getState(), null, 2);
+    jsonMsg.textContent = '💡 已加载当前状态，可直接编辑后点击「应用修改」';
+  } else {
+    jsonMsg.textContent = '';
+  }
+};
+document.getElementById('btnCloseJson').onclick = () => {
+  jsonPanel.style.display = 'none';
+  jsonPanelVisible = false;
+  jsonMsg.textContent = '';
+};
+
+// 应用修改后的 JSON
+document.getElementById('btnApplyJson').onclick = () => {
+  try {
+    const newState = JSON.parse(jsonInput.value);
+    if (board.setState(newState)) {
+      jsonMsg.textContent = '✅ 状态已应用';
+      document.getElementById('inputCols').value = board.state.cols;
+      document.getElementById('inputRows').value = board.state.rows;
+    } else {
+      jsonMsg.textContent = '❌ 无效状态格式';
+    }
+  } catch (e) {
+    jsonMsg.textContent = '❌ JSON 解析错误: ' + e.message;
+  }
+};
+</script>
+</body>
+</html>
